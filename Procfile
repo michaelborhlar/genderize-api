@@ -1,1 +1,1 @@
-web: gunicorn my_data.wsgi
+web: gunicorn genderize-api.wsgi
