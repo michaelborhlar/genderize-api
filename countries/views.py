@@ -1,105 +1,68 @@
-import os
-from datetime import datetime
-from PIL import Image, ImageDraw
-from django.http import JsonResponse, FileResponse
-from django.shortcuts import get_object_or_404
-from rest_framework import status, generics
-from rest_framework.views import APIView
-from django.db.models import F
-from .models import Country, RefreshStatus
-from .serializers import CountrySerializer
-from .services import refresh_countries_data
+import requests
+from datetime import datetime, timezone
+from django.http import JsonResponse
+from django.views import View
 
-CACHE_DIR = "cache"
-SUMMARY_IMAGE_PATH = os.path.join(CACHE_DIR, "summary.png")
+GENDERIZE_URL = "https://api.genderize.io/"
 
 
-class RefreshCountriesView(APIView):
-    """POST /countries/refresh — Fetch and cache data"""
-    def post(self, request):
+def error_response(status, message):
+    return JsonResponse({"status": "error", "message": message}, status=status)
+
+
+class ClassifyView(View):
+    def get(self, request):
+        name = request.GET.get("name")
+
+        # 400 – missing or empty
+        if name is None or name == "":
+            return error_response(400, "Missing or empty name parameter")
+
+        # 422 – query params are always strings in Django, but guard against
+        # someone passing a list-style param e.g. ?name[]=foo
+        if not isinstance(name, str):
+            return error_response(422, "name must be a string")
+
         try:
-            result = refresh_countries_data()
-            self.generate_summary_image()
-            return JsonResponse(result, status=status.HTTP_200_OK)
-        except Exception as e:
-            import traceback
-            print(traceback.format_exc())
-            return JsonResponse(
-                {"error": "Failed to refresh countries", "details": str(e)},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            upstream = requests.get(
+                GENDERIZE_URL,
+                params={"name": name},
+                timeout=5,
+            )
+        except requests.exceptions.Timeout:
+            return error_response(502, "Upstream API timed out")
+        except requests.exceptions.RequestException:
+            return error_response(502, "Upstream API returned an error")
+
+        if not upstream.ok:
+            return error_response(502, "Upstream API returned an error")
+
+        try:
+            data = upstream.json()
+        except ValueError:
+            return error_response(500, "Internal server error")
+
+        # Edge case: no prediction available
+        if data.get("gender") is None or data.get("count") == 0:
+            return error_response(
+                200,
+                "No prediction available for the provided name",
             )
 
-    def generate_summary_image(self):
-        """Create summary image with top 5 countries by estimated GDP"""
-        os.makedirs(CACHE_DIR, exist_ok=True)
-        img = Image.new("RGB", (600, 400), color=(255, 255, 255))
-        draw = ImageDraw.Draw(img)
+        gender = data["gender"]
+        probability = data["probability"]
+        sample_size = data["count"]           # rename count → sample_size
+        is_confident = probability >= 0.7 and sample_size >= 100
+        processed_at = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
-        draw.text((20, 20), "Country Summary", fill="black")
-
-        top_countries = Country.objects.order_by(F('estimated_gdp').desc())[:5]
-        y = 60
-        for c in top_countries:
-            draw.text((20, y), f"{c.name}: {round(c.estimated_gdp or 0, 2)}", fill="blue")
-            y += 30
-
-        total = Country.objects.count()
-        draw.text((20, 280), f"Total: {total}", fill="black")
-        draw.text((20, 310), f"Generated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}", fill="gray")
-
-        img.save(SUMMARY_IMAGE_PATH)
-
-
-class CountryListView(generics.ListAPIView):
-    serializer_class = CountrySerializer
-
-    def get_queryset(self):
-        qs = Country.objects.all()
-        region = self.request.GET.get("region")
-        currency = self.request.GET.get("currency")
-        sort = self.request.GET.get("sort")
-
-        if region:
-            qs = qs.filter(region__iexact=region)
-        if currency:
-            qs = qs.filter(currency_code__iexact=currency)
-        if sort == "gdp_desc":
-            qs = qs.order_by('-estimated_gdp')   # descending numeric order
-        elif sort == "gdp_asc":
-            qs = qs.order_by('estimated_gdp')
-
-        return qs
-
-class CountryDetailView(APIView):
-    def get(self, request, name):
-        try:
-            country = Country.objects.get(name__iexact=name)
-            return JsonResponse(CountrySerializer(country).data, safe=False)
-        except Country.DoesNotExist:
-            return JsonResponse({"error": "Country not found"}, status=404)
-
-    def delete(self, request, name):
-        country = Country.objects.filter(name__iexact=name).first()
-        if not country:
-            return JsonResponse({"error": "Country not found"}, status=404)
-        country.delete()
-        return JsonResponse({"message": f"{name} deleted successfully."})
-    
-class StatusView(APIView):
-    """GET /status — Show total countries and last refresh"""
-    def get(self, request):
-        status_obj = RefreshStatus.objects.first()
-        if not status_obj:
-            return JsonResponse({"total_countries": 0, "last_refreshed_at": None})
         return JsonResponse({
-            "total_countries": status_obj.total_countries,
-            "last_refreshed_at": status_obj.last_refreshed_at
-        })
-
-
-# countries/views.py - SummaryImageView
-class SummaryImageView(APIView):
-    def get(self, request):
-        if not os.path.exists(SUMMARY_IMAGE_PATH):
-            return JsonResponse({"error": "Summary image not found"}, status=404)
-        return FileResponse(open(SUMMARY_IMAGE_PATH, "rb"), content_type="image/png", status=200)
+            "status": "success",
+            "data": {
+                "name": data["name"],
+                "gender": gender,
+                "probability": probability,
+                "sample_size": sample_size,
+                "is_confident": is_confident,
+                "processed_at": processed_at,
+            },
+        }, status=200)
