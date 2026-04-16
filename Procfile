@@ -1,1 +1,1 @@
-web: gunicorn currency_exchange.wsgi
+web: gunicorn my_data.wsgi
